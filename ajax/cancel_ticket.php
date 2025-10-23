@@ -1,72 +1,89 @@
 <?php
-// Set content type to JSON
-header('Content-Type: application/json');
-
-// Start session
-session_start();
-
+header('Content-Type: application/json; charset=utf-8');
 require_once __DIR__ . '/../config/auth.php';
 
-// Get database connection
-global $db;
+try {
+    $auth->requireLogin();
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        echo json_encode(['success' => false, 'message' => 'Geçersiz istek']);
+        exit;
+    }
 
-// Check authentication
-if (!$auth->isLoggedIn()) {
-    echo json_encode(['error' => 'Giriş yapmanız gerekiyor']);
-    exit;
-}
-
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $ticketId = $_POST['ticket_id'] ?? '';
-    
     if (!$ticketId) {
-        echo json_encode(['success' => false, 'message' => 'Bilet ID gerekli.']);
+        echo json_encode(['success' => false, 'message' => 'Ticket ID gerekli']);
         exit;
     }
-    
-    // Get ticket details
+
+    // Get ticket with trip info
     $ticket = $db->fetchOne("
-        SELECT t.*, tr.departure_time 
-        FROM tickets t 
-        JOIN trips tr ON t.trip_id = tr.id 
-        WHERE t.id = ? AND t.user_id = ?
-    ", [$ticketId, $_SESSION['user_id']]);
-    
+        SELECT t.*, tr.departure_time, tr.company_id
+        FROM tickets t
+        JOIN trips tr ON t.trip_id = tr.id
+        WHERE t.id = ?
+    ", [$ticketId]);
+
     if (!$ticket) {
-        echo json_encode(['success' => false, 'message' => 'Bilet bulunamadı.']);
+        echo json_encode(['success' => false, 'message' => 'Bilet bulunamadı']);
         exit;
     }
-    
-    // Check if ticket is already cancelled
-    if ($ticket['status'] === 'cancelled') {
-        echo json_encode(['success' => false, 'message' => 'Bu bilet zaten iptal edilmiş.']);
+
+    // Authorization: ticket sahibi ya da admin
+    $currentUserId = $_SESSION['user_id'] ?? null;
+    $isAdmin = $auth->isAdmin();
+    if (!$isAdmin && $ticket['user_id'] !== $currentUserId) {
+        echo json_encode(['success' => false, 'message' => 'Bu bileti iptal etmeye yetkiniz yok']);
         exit;
     }
-    
-    // Check if trip has already departed
-    if (strtotime($ticket['departure_time']) <= time()) {
-        echo json_encode(['success' => false, 'message' => 'Kalkış zamanı geçmiş biletler iptal edilemez.']);
+
+    // Check status
+    if ($ticket['status'] !== 'active') {
+        echo json_encode(['success' => false, 'message' => 'Sadece aktif biletler iptal edilebilir']);
         exit;
     }
-    
-    try {
-        $db->beginTransaction();
-        
-        // Update ticket status
-        $db->query("UPDATE tickets SET status = 'cancelled' WHERE id = ?", [$ticketId]);
-        
-        // Remove seat reservations
-        $db->query("DELETE FROM booked_seats WHERE ticket_id = ?", [$ticketId]);
-        
-        $db->commit();
-        
-        echo json_encode(['success' => true, 'message' => 'Bilet başarıyla iptal edildi.']);
-        
-    } catch (Exception $e) {
-        $db->rollback();
-        echo json_encode(['success' => false, 'message' => 'Bilet iptal etme sırasında hata oluştu: ' . $e->getMessage()]);
+
+    // 1 saat kuralı: kalkış zamanından en az 1 saat önce iptal olmalı
+    $departureTs = strtotime($ticket['departure_time']);
+    if ($departureTs !== false) {
+        if (($departureTs - time()) < 3600) {
+            echo json_encode(['success' => false, 'message' => 'Kalkışa 1 saatten az kaldığı için iptal edilemez']);
+            exit;
+        }
     }
-} else {
-    echo json_encode(['success' => false, 'message' => 'Geçersiz istek.']);
+
+    // Transaction: update ticket, delete booked_seats, refund balance, update coupon used_count
+    $db->query("BEGIN TRANSACTION");
+
+    // Mark ticket cancelled
+    $db->update('tickets', ['status' => 'cancelled'], 'id = ?', [$ticketId]);
+
+    // Refund to user balance (add total_price)
+    $ticketRow = $db->fetchOne("SELECT total_price, user_id, coupon_id FROM tickets WHERE id = ?", [$ticketId]);
+    $totalPrice = floatval($ticketRow['total_price'] ?? 0);
+    $userId = $ticketRow['user_id'];
+
+    if ($totalPrice > 0) {
+        // increase user balance
+        $db->query("UPDATE users SET balance = COALESCE(balance,0) + ? WHERE id = ?", [$totalPrice, $userId]);
+    }
+
+    // Delete booked seats for this ticket
+    $db->query("DELETE FROM booked_seats WHERE ticket_id = ?", [$ticketId]);
+
+    // If coupon was used, decrement used_count (if >0)
+    if (!empty($ticketRow['coupon_id'])) {
+        $couponId = $ticketRow['coupon_id'];
+        $db->query("UPDATE coupons SET used_count = CASE WHEN used_count > 0 THEN used_count - 1 ELSE 0 END WHERE id = ?", [$couponId]);
+    }
+
+    $db->query("COMMIT");
+
+    echo json_encode(['success' => true, 'message' => 'Bilet başarıyla iptal edildi']);
+
+} catch (Exception $e) {
+    if (isset($db)) {
+        $db->query("ROLLBACK");
+    }
+    http_response_code(500);
+    echo json_encode(['success' => false, 'message' => 'Sunucu hatası: ' . $e->getMessage()]);
 }
-?>
