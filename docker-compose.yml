@@ -1,0 +1,47 @@
+# Bilet Satın Alma Platformu
+# Docker Compose Configuration
+
+version: '3.8'
+
+services:
+  bilet-platformu:
+    build: .
+    container_name: bilet-satin-alma-platformu
+    ports:
+      - "8080:80"
+    volumes:
+      - ./database:/var/www/html/database
+      - ./uploads:/var/www/html/uploads
+    environment:
+      - APACHE_DOCUMENT_ROOT=/var/www/html
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Add a database backup service
+  db-backup:
+    image: alpine:latest
+    container_name: bilet-db-backup
+    volumes:
+      - ./database:/backup/database
+      - ./backups:/backup/backups
+    command: |
+      sh -c '
+        while true; do
+          sleep 86400
+          timestamp=$$(date +%Y%m%d_%H%M%S)
+          cp /backup/database/bilet_satin_alma.db /backup/backups/bilet_satin_alma_$$timestamp.db
+          echo "Database backup created: bilet_satin_alma_$$timestamp.db"
+        done
+      '
+    restart: unless-stopped
+    depends_on:
+      - bilet-platformu
+
+networks:
+  default:
+    name: bilet-platformu-network
